@@ -1,0 +1,380 @@
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const PORT = 8000;
+
+app.use(express.json({ limit: '100mb' }));
+
+const storagePath = path.join(__dirname, 'data');
+const coinsFile = path.join(storagePath, 'coins.json');
+const inventoryFile = path.join(storagePath, 'inventory.json');
+
+if (!fs.existsSync(storagePath)) fs.mkdirSync(storagePath);
+if (!fs.existsSync(coinsFile)) fs.writeFileSync(coinsFile, JSON.stringify({}));
+if (!fs.existsSync(inventoryFile)) fs.writeFileSync(inventoryFile, JSON.stringify({}));
+
+const GASOLINE_SELL_PRICE = 30;
+let knownPlayers = new Set();
+let coinStorage = {};
+let playerInventory = {};
+let playerCoins = new Map();
+let processedEvents = new Set();
+
+const shop = {
+  "nails": { price: 20, quantity: 255 },
+  "energy_cells": { price: 60, quantity: 255 },
+  "grenade": { price: 100, quantity: 10 },
+  "steel_wall": { price: 100, quantity: 20 },
+  "steel_bigdoor": { price: 75, quantity: 20 },
+  "stone_wall": { price: 75, quantity: 20 },
+  "stone_floor": { price: 70, quantity: 50 },
+  "sleeping_bag": { price: 100, quantity: 5 },
+  "armor_fire_3": { price: 120, quantity: 1 },
+  "armor_tesla_2": { price: 150, quantity: 1 },
+  "dynamite": { price: 100, quantity: 5 },
+  "hammer": { price: 30, quantity: 1 },
+  "ak47": { price: 100, quantity: 1 },
+  "bullet_sniper": { price: 50, quantity: 255 },
+  "laser_submachine": { price: 120, quantity: 1 },
+  "laser_sniper": { price: 100, quantity: 1 },
+  "nailgun": { price: 30, quantity: 1 },
+  "repair_hammer": { price: 30, quantity: 1 },
+  "sniper": { price: 70, quantity: 1 },
+  "laser_pistol": { price: 70, quantity: 1 },
+  "lapadone": { price: 100, quantity: 5 },
+  "small_wire": { price: 200, quantity: 12 }
+};
+
+function debugLog(category, message, data = null) {
+  const timestamp = new Date().toLocaleTimeString();
+  console.log(`[${timestamp}] ${category}: ${message}`);
+  if (data) {
+    console.log(`[${timestamp}] DATA:`, JSON.stringify(data, null, 2));
+  }
+}
+
+function loadCoinData() {
+  try {
+    const data = JSON.parse(fs.readFileSync(coinsFile));
+    playerCoins = new Map(Object.entries(data));
+    coinStorage = data;
+    debugLog('LOAD', `Loaded ${Object.keys(data).length} player coin records`);
+    return data;
+  } catch (err) {
+    debugLog('ERROR', 'Failed to load coin data', err.message);
+    return {};
+  }
+}
+
+function saveCoinData(data) {
+  try {
+    fs.writeFileSync(coinsFile, JSON.stringify(data, null, 2));
+  } catch (err) {
+    debugLog('ERROR', 'Failed to save coin data', err.message);
+  }
+}
+
+function loadInventoryData() {
+  try {
+    const data = JSON.parse(fs.readFileSync(inventoryFile));
+    debugLog('LOAD', `Loaded ${Object.keys(data).length} player inventory records`);
+    return data;
+  } catch (err) {
+    debugLog('ERROR', 'Failed to load inventory data', err.message);
+    return {};
+  }
+}
+
+function saveInventoryData(data) {
+  try {
+    fs.writeFileSync(inventoryFile, JSON.stringify(data, null, 2));
+  } catch (err) {
+    debugLog('ERROR', 'Failed to save inventory data', err.message);
+  }
+}
+
+coinStorage = loadCoinData();
+playerInventory = loadInventoryData();
+
+function ensurePlayerHasCoins(player) {
+  const playerKey = player.nickname || player.id;
+  if (!playerCoins.has(playerKey)) {
+    const savedCoins = coinStorage[playerKey] || 100;
+    playerCoins.set(playerKey, savedCoins);
+    debugLog('PLAYER', `Initialized coins for ${player.nickname}: ${savedCoins}`);
+    return true;
+  }
+  return false;
+}
+
+function updateCoins(player, newAmount) {
+  const playerKey = player.nickname || player.id;
+  const oldAmount = playerCoins.get(playerKey) || 0;
+  playerCoins.set(playerKey, newAmount);
+  coinStorage[playerKey] = newAmount;
+  saveCoinData(coinStorage);
+  
+  debugLog('COINS', `${player.nickname}: ${oldAmount} → ${newAmount} (${newAmount - oldAmount >= 0 ? '+' : ''}${newAmount - oldAmount})`);
+}
+
+function processChatCommand(event, players) {
+  const player = players?.find(p => p.gid === event.gid);
+  if (!player) {
+    debugLog('CHAT_ERROR', 'Player not found for chat command', { gid: event.gid });
+    return [];
+  }
+
+  const msg = (event.message || '').toLowerCase().trim();
+  const commands = [];
+  const playerKey = player.nickname || player.id;
+
+  debugLog('CHAT', `${player.nickname}: ${msg}`);
+
+  if (msg === '?bal' || msg === '?balance') {
+    const coins = playerCoins.get(playerKey) || 0;
+    commands.push(`!message-to=${player.id}::Balance: ${coins} coins`);
+  }
+
+  else if (msg === '?shop') {
+    const itemCount = Object.keys(shop).length;
+    commands.push(`!message-to=${player.id}::SELL gasoline: ${GASOLINE_SELL_PRICE}c each | BUY ${itemCount} items | Use ?buy=itemname`);
+  }
+
+  else if (msg === '?sell') {
+    let gasoline = 0;
+    let gasolineItem = null;
+    
+    console.log('=== INVENTORY DEBUG ===');
+    console.log(`Player: ${player.nickname}`);
+    console.log('Full player object:', JSON.stringify(player, null, 2));
+    console.log('======================');
+    
+    if (playerInventory[playerKey] && playerInventory[playerKey].gasoline > 0) {
+      gasoline = playerInventory[playerKey].gasoline;
+      console.log(`Found ${gasoline} gasoline in storage`);
+    }
+    
+    if (gasoline === 0 && player.inventory) {
+      if (Array.isArray(player.inventory)) {
+        for (let item of player.inventory) {
+          if (item && typeof item === 'object') {
+            console.log('Checking item:', item);
+            if (item.name && (item.name.toLowerCase().includes('gasoline') || item.name.toLowerCase().includes('gas'))) {
+              gasoline = item.quantity || item.amount || item.count || 1;
+              gasolineItem = item;
+              console.log(`Found gasoline by name: ${item.name}, quantity: ${gasoline}`);
+              break;
+            }
+            if (item.type && (item.type.toLowerCase().includes('gasoline') || item.type.toLowerCase().includes('gas'))) {
+              gasoline = item.quantity || item.amount || item.count || 1;
+              gasolineItem = item;
+              console.log(`Found gasoline by type: ${item.type}, quantity: ${gasoline}`);
+              break;
+            }
+          }
+        }
+      } else if (typeof player.inventory === 'object') {
+        console.log('Inventory is object, checking properties...');
+        for (let key in player.inventory) {
+          console.log(`Checking property: ${key} = ${player.inventory[key]}`);
+          if (key.toLowerCase().includes('gasoline') || key.toLowerCase().includes('gas')) {
+            gasoline = player.inventory[key];
+            console.log(`Found gasoline in property: ${key}, value: ${gasoline}`);
+            break;
+          }
+        }
+      }
+    }
+    
+    console.log(`Final gasoline count: ${gasoline}`);
+    
+    if (gasoline > 0) {
+      if (playerInventory[playerKey] && playerInventory[playerKey].gasoline > 0) {
+        playerInventory[playerKey].gasoline = 0;
+        saveInventoryData(playerInventory);
+      } else {
+        commands.push(`!remove-to=${player.id}::gasoline*${gasoline}`);
+      }
+      
+      const totalEarnings = gasoline * GASOLINE_SELL_PRICE;
+      const currentCoins = playerCoins.get(playerKey) || 0;
+      const newCoins = currentCoins + totalEarnings;
+      updateCoins(player, newCoins);
+      
+      commands.push(`!message-to=${player.id}::Sold ${gasoline} gasoline for ${totalEarnings} coins! Balance: ${newCoins} coins`);
+      
+      debugLog('GASOLINE_BULK_SELL', `${player.nickname} sold ${gasoline} gasoline for ${totalEarnings} coins total`);
+    } else {
+      commands.push(`!message-to=${player.id}::No gasoline found in inventory! Make sure you have gasoline items.`);
+      debugLog('SELL_FAILED', `${player.nickname} has no gasoline to sell`);
+    }
+  }
+
+  else if (msg.startsWith('?buy=')) {
+    const itemName = msg.substring(5).trim();
+
+    if (itemName === 'gasoline' || itemName === 'gas') {
+      commands.push(`!message-to=${player.id}::Cannot buy gasoline. Find gasoline in the world or get it from other players.`);
+      return commands;
+    }
+
+    let foundItem = null;
+    for (const [shopItem, data] of Object.entries(shop)) {
+      if (shopItem === itemName || shopItem.includes(itemName) || itemName.includes(shopItem)) {
+        foundItem = { name: shopItem, price: data.price, quantity: data.quantity };
+        break;
+      }
+    }
+
+    if (foundItem) {
+      const coins = playerCoins.get(playerKey) || 0;
+      if (coins >= foundItem.price) {
+        const newBalance = coins - foundItem.price;
+        updateCoins(player, newBalance);
+
+        commands.push(`!item-to=${player.id}::${foundItem.name}*${foundItem.quantity}`);
+        commands.push(`!message-to=${player.id}::Bought ${foundItem.quantity}x ${foundItem.name} for ${foundItem.price} coins! Balance: ${newBalance}`);
+        
+        debugLog('PURCHASE', `${player.nickname} bought ${foundItem.quantity}x ${foundItem.name} for ${foundItem.price} coins`);
+      } else {
+        const needed = foundItem.price - coins;
+        commands.push(`!message-to=${player.id}::Need ${needed} more coins for ${foundItem.name} (${foundItem.price}c)`);
+      }
+    } else {
+      commands.push(`!message-to=${player.id}::Item '${itemName}' not found. Use ?shop`);
+    }
+  }
+
+  else if (msg === '?help' || msg === '?commands') {
+    commands.push(`!message-to=${player.id}::Commands: ?bal ?shop ?buy=itemname ?sell`);
+  }
+
+  return commands;
+}
+
+app.post("/devast", (req, res) => {
+  const { players, events } = req.body;
+  const commands = [];
+
+  debugLog('REQUEST', `Processing request`, {
+    playersCount: players?.length || 0,
+    eventsCount: events?.length || 0,
+    timestamp: new Date().toISOString()
+  });
+
+  if (Array.isArray(players)) {
+    console.log(`Processing ${players.length} players...`);
+    
+    const currentPlayerIds = players.map(p => p.id);
+    
+    const playersToRemove = [...knownPlayers].filter(id => !currentPlayerIds.includes(id));
+    playersToRemove.forEach(id => {
+      knownPlayers.delete(id);
+      console.log(`Player ${id} left the game, removed from known players`);
+    });
+    
+    players.forEach(player => {
+      if (!knownPlayers.has(player.id)) {
+        knownPlayers.add(player.id);
+        
+        commands.push(`!message-to=${player.id}::Welcome to [SHOPS] - WasteLands - SandBox x20 ${player.nickname || 'Player'}!`);
+        commands.push(`!message-to=${player.id}::Shop Added ?bal, ?buy=, ?sell | our discord server discord.gg/PGr6UEcbCf`);
+        
+        console.log(`New/returning player: ${player.nickname || 'unnamed'} (ID: ${player.id})`);
+      }
+      
+      ensurePlayerHasCoins(player);
+    });
+  } else {
+    console.log("No players array found");
+  }
+
+  if (Array.isArray(events)) {
+    events.forEach(event => {
+      if (processedEvents.has(event.id)) return;
+      processedEvents.add(event.id);
+
+      if (event.type === 'chat') {
+        const chatCommands = processChatCommand(event, players);
+        commands.push(...chatCommands);
+      }
+    });
+  }
+
+  if (processedEvents.size > 1000) {
+    const eventsArray = Array.from(processedEvents);
+    processedEvents = new Set(eventsArray.slice(-500));
+    debugLog('CLEANUP', 'Cleaned processed events', { kept: 500 });
+  }
+
+  debugLog('RESPONSE', `Sending ${commands.length} commands`);
+  console.log(`Total commands: ${commands.length}`);
+  console.log("Commands:", commands);
+  
+  res.json({ type: "commands", content: commands });
+});
+
+app.post("/admin/addcoins", (req, res) => {
+  const { playerNickname, amount } = req.body;
+
+  if (playerNickname && amount) {
+    const currentCoins = playerCoins.get(playerNickname) || 0;
+    const newBalance = currentCoins + amount;
+    playerCoins.set(playerNickname, newBalance);
+    coinStorage[playerNickname] = newBalance;
+    saveCoinData(coinStorage);
+
+    debugLog('ADMIN', `Added ${amount} coins to ${playerNickname} → ${newBalance}`);
+    res.json({ success: true, newBalance });
+  } else {
+    res.json({ success: false, error: "Missing playerNickname or amount" });
+  }
+});
+
+app.post("/admin/addgasoline", (req, res) => {
+  const { playerNickname, amount } = req.body;
+
+  if (playerNickname && amount) {
+    if (!playerInventory[playerNickname]) {
+      playerInventory[playerNickname] = { gasoline: 0 };
+    }
+    
+    const currentGasoline = playerInventory[playerNickname].gasoline || 0;
+    const newGasoline = currentGasoline + amount;
+    playerInventory[playerNickname].gasoline = newGasoline;
+    saveInventoryData(playerInventory);
+
+    debugLog('ADMIN', `Added ${amount} gasoline to ${playerNickname} → ${newGasoline}`);
+    res.json({ success: true, newGasoline });
+  } else {
+    res.json({ success: false, error: "Missing playerNickname or amount" });
+  }
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "WasteLands Shop Server Online",
+    players: playerCoins.size,
+    processedEvents: processedEvents.size,
+    gasolineSellPrice: GASOLINE_SELL_PRICE,
+    uptime: process.uptime()
+  });
+});
+
+app.use(function (req, res) {
+  res.status(404).json({ error: "Not found" });
+});
+
+app.listen(PORT, () => {
+  debugLog('SERVER', 'WasteLands Shop Server Started', {
+    port: PORT,
+    gasolineSellPrice: GASOLINE_SELL_PRICE + ' coins per gasoline',
+    shopItems: Object.keys(shop).length
+  });
+  
+  console.log(`=== WasteLands Shop Server ===`);
+  console.log(`Port: ${PORT}`);
+  console.log(`Gasoline Sell Price: ${GASOLINE_SELL_PRICE} coins each`);
+});
